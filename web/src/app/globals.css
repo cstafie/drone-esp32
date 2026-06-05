@@ -1,0 +1,93 @@
+@import "tailwindcss";
+
+:root {
+  --bg: #f4f5f0;
+  --surface: #fbfbf8;
+  --surface-strong: #ecede6;
+  --text: #1b2116;
+  --muted: #4a5442;
+  --accent: #ee5f2a;
+  --accent-2: #3d9b7a;
+}
+
+@theme inline {
+  --color-background: var(--bg);
+  --color-foreground: var(--text);
+  --font-sans: var(--font-display);
+  --font-mono: var(--font-mono);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  background:
+    radial-gradient(circle at 0% 0%, #f7d3c4 0%, transparent 45%),
+    radial-gradient(circle at 100% 100%, #b8dfd1 0%, transparent 40%), var(--bg);
+  color: var(--text);
+  font-family: var(--font-display), sans-serif;
+}
+
+.panel {
+  background: color-mix(in oklab, var(--surface) 90%, white 10%);
+  border: 1px solid color-mix(in oklab, var(--surface-strong) 70%, black 10%);
+  border-radius: 20px;
+  box-shadow:
+    0 8px 20px rgb(0 0 0 / 0.07),
+    inset 0 1px 0 rgb(255 255 255 / 0.9);
+}
+
+.status-pill {
+  border-radius: 999px;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+}
+
+.status-pill.connected {
+  background: color-mix(in oklab, var(--accent-2) 25%, white 75%);
+  color: #0f4d39;
+}
+
+.status-pill.disconnected {
+  background: color-mix(in oklab, #c13f1d 25%, white 75%);
+  color: #6c1d0f;
+}
+
+.btn {
+  border-radius: 14px;
+  border: 1px solid transparent;
+  padding: 12px 16px;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    transform 120ms ease,
+    box-shadow 120ms ease;
+}
+
+.btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+}
+
+.btn-primary {
+  background: var(--accent);
+  color: #fff;
+  box-shadow: 0 8px 15px rgb(238 95 42 / 0.25);
+}
+
+.btn-secondary {
+  background: #fff;
+  color: var(--text);
+  border-color: #cfd5c8;
+}
+
+.mono {
+  font-family: var(--font-mono), monospace;
+}

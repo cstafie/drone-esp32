@@ -1,0 +1,13 @@
+# Node / Next
+web/node_modules/
+web/.next/
+web/.env.local
+
+# PlatformIO
+firmware/.pio/
+firmware/.vscode/
+firmware/include/config.h
+
+# OS
+.DS_Store
+Thumbs.db

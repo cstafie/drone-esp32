@@ -1,0 +1,53 @@
+#pragma once
+
+// ESP32 firmware does not read OS env vars at runtime.
+// Instead, treat these as compile-time "env-style" values:
+// - defaults below for local development
+// - optional override via PlatformIO build flags, for example:
+//   -D WIFI_SSID_VALUE='"MyWifi"' -D WIFI_PASSWORD_VALUE='"secret"'
+
+// Set Wi-Fi credentials for station mode.
+#ifndef WIFI_SSID_VALUE
+#define WIFI_SSID_VALUE "your-wifi-name"
+#endif
+
+#ifndef WIFI_PASSWORD_VALUE
+#define WIFI_PASSWORD_VALUE "your-wifi-password"
+#endif
+
+// AP fallback if station mode cannot connect.
+#ifndef AP_SSID_VALUE
+#define AP_SSID_VALUE "drone-esp32"
+#endif
+
+#ifndef AP_PASSWORD_VALUE
+#define AP_PASSWORD_VALUE "drone1234"
+#endif
+
+// Optional shared token. Match web/.env.local ESP32_DEVICE_TOKEN.
+#ifndef DEVICE_TOKEN_VALUE
+#define DEVICE_TOKEN_VALUE "change-me"
+#endif
+
+// GPIO used for status/test light.
+#ifndef LIGHT_PIN_VALUE
+#define LIGHT_PIN_VALUE 2
+#endif
+
+// NeoPixel RGB LED pin. ESP32-S3-DevKitC-1 uses GPIO48.
+#ifndef RGB_LED_PIN_VALUE
+#define RGB_LED_PIN_VALUE 48
+#endif
+
+#ifndef RGB_LED_COUNT_VALUE
+#define RGB_LED_COUNT_VALUE 1
+#endif
+
+constexpr const char* WIFI_SSID = WIFI_SSID_VALUE;
+constexpr const char* WIFI_PASSWORD = WIFI_PASSWORD_VALUE;
+constexpr const char* AP_SSID = AP_SSID_VALUE;
+constexpr const char* AP_PASSWORD = AP_PASSWORD_VALUE;
+constexpr const char* DEVICE_TOKEN = DEVICE_TOKEN_VALUE;
+constexpr int LIGHT_PIN = LIGHT_PIN_VALUE;
+constexpr int RGB_LED_PIN = RGB_LED_PIN_VALUE;
+constexpr int RGB_LED_COUNT = RGB_LED_COUNT_VALUE;
