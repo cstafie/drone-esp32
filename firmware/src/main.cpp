@@ -20,6 +20,57 @@ bool isStationMode = false;
 bool cameraEnabled = false;
 String ipAddress = "0.0.0.0";
 
+// Lightweight in-memory logs for debugging from the web UI.
+static constexpr int LOG_CAPACITY = 40;
+String logLines[LOG_CAPACITY] = {};
+int logHead = 0;
+int logCount = 0;
+
+void appendLog(const String& line) {
+  String entry = String(millis()) + "ms " + line;
+  logLines[logHead] = entry;
+  logHead = (logHead + 1) % LOG_CAPACITY;
+  if (logCount < LOG_CAPACITY) logCount++;
+  Serial.println(entry);
+}
+
+// FC UART state
+HardwareSerial fcSerial(1); // UART1
+
+// RC — sent continuously at RC_SEND_HZ; ESP32 is always the RC source.
+static constexpr uint32_t RC_SEND_HZ     = 20;   // packets per second
+static constexpr uint32_t RC_SEND_PERIOD = 1000 / RC_SEND_HZ;
+uint8_t  rcPayload[32]      = {};     // current channels (16×uint16_le); safe defaults set in setup()
+unsigned long rcLastSentMs  = 0;
+
+// Motor test — entire sequence runs in loop() so RC never pauses
+enum class MotorTestPhase : uint8_t { IDLE, ARMING, RAMPING, REDUCING, DISARMING };
+MotorTestPhase motorTestPhase    = MotorTestPhase::IDLE;
+unsigned long  motorTestStartMs  = 0;
+unsigned long  motorTestDisarmMs = 0;  // millis() of last disarm — enforces Betaflight rearm lockout
+bool           cachedArmed       = false; // last known armed state from MSP_STATUS
+
+static constexpr uint32_t MT_ARM_MS         =  500; // hold arm signal before ramping
+static constexpr uint32_t MT_RAMP_MS        = 3000; // motors at 1300 µs
+static constexpr uint32_t MT_REDUCE_MS      =  300; // throttle back to 1000 before disarm
+static constexpr uint32_t MT_DISARM_MS      =  300; // hold disarm signal
+static constexpr uint32_t REARM_COOLDOWN_MS = 6000; // Betaflight ~5 s disarm lockout
+
+static void setChannel(int idx, uint16_t val) {
+  rcPayload[idx * 2]     = val & 0xFF;
+  rcPayload[idx * 2 + 1] = (val >> 8) & 0xFF;
+}
+
+static const char* motorTestPhaseName() {
+  switch (motorTestPhase) {
+    case MotorTestPhase::ARMING:    return "arming";
+    case MotorTestPhase::RAMPING:   return "ramping";
+    case MotorTestPhase::REDUCING:  return "reducing";
+    case MotorTestPhase::DISARMING: return "disarming";
+    default:                        return "idle";
+  }
+}
+
 // ─── LED ─────────────────────────────────────────────────────────────────────
 
 void applyColor(uint8_t r, uint8_t g, uint8_t b) {
@@ -45,7 +96,255 @@ String buildLightJson() {
   serializeJson(doc, out);
   return out;
 }
+// ─── FC UART / MSP ─────────────────────────────────────────────────────────────────────
+//
+// Protocol: MSP (MultiWii Serial Protocol) — used by Betaflight for telemetry
+// and RC control. Betaflight setup required before this works:
+//   1. Ports tab → enable MSP on the UART you wired to ESP32, baud 115200.
+//   2. CLI →  set msp_override_channels = 31   (ch 1-5: roll/pitch/throttle/yaw/AUX1)
+//             save
+//
 
+static constexpr uint32_t MSP_TIMEOUT_MS = 300;
+static constexpr uint8_t  MSP_STATUS     = 101;
+static constexpr uint8_t  MSP_ATTITUDE   = 108;
+static constexpr uint8_t  MSP_ANALOG     = 110;
+static constexpr uint8_t  MSP_SET_RAW_RC = 200;
+
+static void mspSend(uint8_t cmd, const uint8_t* payload, uint8_t len) {
+  uint8_t chk = len ^ cmd;
+  for (uint8_t i = 0; i < len; i++) chk ^= payload[i];
+  fcSerial.write('$'); fcSerial.write('M'); fcSerial.write('<');
+  fcSerial.write(len); fcSerial.write(cmd);
+  if (len > 0) fcSerial.write(payload, len);
+  fcSerial.write(chk);
+  fcSerial.flush();
+}
+
+enum ParserState {
+  S_HEADER_DOLLAR,
+  S_HEADER_M,
+  S_HEADER_ARROW,
+  S_SIZE,
+  S_CMD,
+  S_PAYLOAD,
+  S_CHECKSUM
+};
+
+ParserState parserState = S_HEADER_DOLLAR;
+uint8_t rxSize = 0;
+uint8_t rxCmd = 0;
+uint8_t rxBuf[64] = {};
+uint8_t rxCount = 0;
+uint8_t rxChecksum = 0;
+
+// Global telemetry variables
+bool fcArmed = false;
+float fcRoll = 0.0f;
+float fcPitch = 0.0f;
+float fcYaw = 0.0f;
+float fcVbat = 0.0f;
+float fcAmps = 0.0f;
+unsigned long fcLastResponseMs = 0;
+
+void handleMspPacket(uint8_t cmd, const uint8_t* buf, uint8_t len) {
+  fcLastResponseMs = millis();
+  
+  if (cmd == MSP_STATUS && len >= 11) {
+    uint32_t flags = (uint32_t)buf[6] | ((uint32_t)buf[7] << 8)
+                   | ((uint32_t)buf[8] << 16) | ((uint32_t)buf[9] << 24);
+    fcArmed = (flags & 1u) != 0;
+    cachedArmed = fcArmed;
+  }
+  else if (cmd == MSP_ATTITUDE && len >= 6) {
+    int16_t roll  = (int16_t)((uint16_t)buf[0] | ((uint16_t)buf[1] << 8));
+    int16_t pitch = (int16_t)((uint16_t)buf[2] | ((uint16_t)buf[3] << 8));
+    int16_t yaw   = (int16_t)((uint16_t)buf[4] | ((uint16_t)buf[5] << 8));
+    fcRoll  = roll  / 10.0f;
+    fcPitch = pitch / 10.0f;
+    fcYaw   = (float)yaw;
+  }
+  else if (cmd == MSP_ANALOG && len >= 7) {
+    fcVbat = buf[0] / 10.0f;
+    int16_t amp  = (int16_t)((uint16_t)buf[5] | ((uint16_t)buf[6] << 8));
+    fcAmps  = amp / 100.0f;
+  }
+}
+
+void parseMspByte(uint8_t b) {
+  switch (parserState) {
+    case S_HEADER_DOLLAR:
+      if (b == '$') parserState = S_HEADER_M;
+      break;
+    case S_HEADER_M:
+      if (b == 'M') parserState = S_HEADER_ARROW;
+      else parserState = S_HEADER_DOLLAR;
+      break;
+    case S_HEADER_ARROW:
+      if (b == '>') parserState = S_SIZE;
+      else parserState = S_HEADER_DOLLAR;
+      break;
+    case S_SIZE:
+      rxSize = b;
+      rxChecksum = b;
+      rxCount = 0;
+      parserState = S_CMD;
+      break;
+    case S_CMD:
+      rxCmd = b;
+      rxChecksum ^= b;
+      if (rxSize == 0) {
+        parserState = S_CHECKSUM;
+      } else if (rxSize > sizeof(rxBuf)) {
+        parserState = S_HEADER_DOLLAR;
+      } else {
+        parserState = S_PAYLOAD;
+      }
+      break;
+    case S_PAYLOAD:
+      rxBuf[rxCount] = b;
+      rxChecksum ^= b;
+      rxCount++;
+      if (rxCount >= rxSize) {
+        parserState = S_CHECKSUM;
+      }
+      break;
+    case S_CHECKSUM:
+      if (b == rxChecksum) {
+        handleMspPacket(rxCmd, rxBuf, rxSize);
+      }
+      parserState = S_HEADER_DOLLAR;
+      break;
+  }
+}
+
+void handleFcTelemetry() {
+  Serial.println("[HTTP] GET /api/v1/fc/telemetry");
+  JsonDocument doc;
+  doc["ok"] = true;
+  doc["motorTest"] = motorTestPhaseName();
+  doc["rcThr"] = (uint16_t)rcPayload[4] | ((uint16_t)rcPayload[5] << 8);
+  doc["rcAux1"] = (uint16_t)rcPayload[8] | ((uint16_t)rcPayload[9] << 8);
+  doc["rearmCooldownMs"] = (motorTestDisarmMs > 0 && millis() - motorTestDisarmMs < REARM_COOLDOWN_MS)
+                              ? (REARM_COOLDOWN_MS - (millis() - motorTestDisarmMs))
+                              : 0;
+
+  if (millis() - fcLastResponseMs < 3000) {
+    doc["armed"] = fcArmed;
+    doc["roll"]  = fcRoll;
+    doc["pitch"] = fcPitch;
+    doc["yaw"]   = fcYaw;
+    doc["vbatV"] = fcVbat;
+    doc["ampA"]  = fcAmps;
+  } else {
+    doc["armed"]   = false;
+    doc["fcError"] = "No response from FC — check UART wiring and Betaflight port config";
+  }
+
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
+void handleLogs() {
+  JsonDocument doc;
+  doc["ok"] = true;
+  JsonArray arr = doc["logs"].to<JsonArray>();
+  for (int i = 0; i < logCount; i++) {
+    int idx = (logHead - logCount + i + LOG_CAPACITY) % LOG_CAPACITY;
+    arr.add(logLines[idx]);
+  }
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
+void handleFcRcSet() {
+  Serial.println("[HTTP] POST /api/v1/fc/rc");
+  String body = server.arg("plain");
+
+  JsonDocument req;
+  if (deserializeJson(req, body) || !req["channels"].is<JsonArray>()) {
+    server.send(400, "application/json", R"json({"ok":false,"error":"Expected {channels:[...]} array (16 values 1000-2000)"})json");
+    return;
+  }
+
+  JsonArray arr = req["channels"].as<JsonArray>();
+  for (int i = 0; i < 16; i++) {
+    uint16_t val = (i < (int)arr.size())
+                   ? (uint16_t)constrain((int)arr[i], 1000, 2000)
+                   : (i == 2 ? 1000u : 1500u);
+    setChannel(i, val);
+  }
+
+  uint16_t thr = (uint16_t)rcPayload[4] | ((uint16_t)rcPayload[5] << 8);
+  uint16_t aux = (uint16_t)rcPayload[8] | ((uint16_t)rcPayload[9] << 8);
+  appendLog("RC update thr=" + String(thr) + " aux1=" + String(aux));
+  server.send(200, "application/json", R"({"ok":true})");
+}
+
+void handleFcArm() {
+  Serial.println("[HTTP] POST /api/v1/fc/arm");
+  String body = server.arg("plain");
+
+  JsonDocument req;
+  if (deserializeJson(req, body) || !req["arm"].is<bool>()) {
+    server.send(400, "application/json", R"json({"ok":false,"error":"Expected {arm:true/false}"})json");
+    return;
+  }
+  bool arm = req["arm"].as<bool>();
+
+  if (arm) {
+    for (int i = 0; i < 16; i++) {
+      if (i == 2)      setChannel(i, 1000u); // throttle low
+      else if (i == 4) setChannel(i, 1500u); // AUX1 = arm
+      else             setChannel(i, 1500u); // others center
+    }
+    appendLog("ARM command aux1=1500 thr=1000");
+  } else {
+    for (int i = 0; i < 16; i++) {
+      if (i == 4)      setChannel(i, 1000u); // AUX1 = disarm
+      else if (i == 2) setChannel(i, 1000u); // throttle low
+      else             setChannel(i, 1500u); // others center
+    }
+    appendLog("DISARM command aux1=1000 thr=1000");
+  }
+  server.send(200, "application/json", R"({"ok":true})");
+}
+
+void handleFcRcStop() {
+  Serial.println("[HTTP] POST /api/v1/fc/rc/stop");
+  if (motorTestPhase != MotorTestPhase::IDLE) {
+    motorTestPhase   = MotorTestPhase::IDLE;
+    motorTestDisarmMs = millis();
+    appendLog("Motor test aborted by rc/stop");
+  }
+  for (int i = 0; i < 16; i++) setChannel(i, (i == 2 || i == 4) ? 1000u : 1500u);
+  appendLog("RC reset safe (thr=1000 aux1=1000)");
+  server.send(200, "application/json", R"({"ok":true})");
+}
+
+void handleFcMotorTest() {
+  Serial.println("[HTTP] POST /api/v1/fc/motor-test");
+  if (motorTestPhase != MotorTestPhase::IDLE) {
+    appendLog("Motor test start rejected: already running");
+    server.send(409, "application/json", R"json({"ok":false,"error":"Motor test already running"})json");
+    return;
+  }
+  if (motorTestDisarmMs > 0 && millis() - motorTestDisarmMs < REARM_COOLDOWN_MS) {
+    appendLog("Motor test start rejected: rearm cooldown");
+    server.send(429, "application/json", R"json({"ok":false,"error":"Please wait ~6 s before re-arming (Betaflight rearm lockout)"})json");
+    return;
+  }
+  for (int i = 0; i < 16; i++) setChannel(i, 1500u);
+  setChannel(2, 1000u); // throttle low
+  setChannel(4, 1500u); // AUX1 arm position
+  motorTestPhase   = MotorTestPhase::ARMING;
+  motorTestStartMs = millis();
+  cachedArmed      = false;
+  appendLog("Motor test start -> ARMING");
+  server.send(202, "application/json", R"({"ok":true,"phase":"arming"})");
+}
 // ─── Camera ───────────────────────────────────────────────────────────────────
 
 bool initCamera() {
@@ -216,11 +515,7 @@ void handleLightStop() {
   server.send(200, "application/json", buildLightJson());
 }
 
-void handleFutureUart() {
-  Serial.println("[HTTP] POST /api/v1/fc/uart (not implemented)");
-  server.send(501, "application/json",
-              R"({"ok":false,"error":"UART control not implemented yet"})");
-}
+void handleFutureUart() {}
 
 void handleNotFound() {
   Serial.printf("[HTTP] 404 %s %s\n",
@@ -260,6 +555,7 @@ void connectWifi() {
 
 void registerRoutes() {
   server.on("/api/v1/health",           HTTP_GET,  handleHealth);
+  server.on("/api/v1/logs",             HTTP_GET,  handleLogs);
   server.on("/api/v1/light/status",     HTTP_GET,  handleLightStatus);
   server.on("/api/v1/light/color",      HTTP_POST, handleLightColor);
   server.on("/api/v1/light/stop",       HTTP_POST, handleLightStop);
@@ -268,7 +564,11 @@ void registerRoutes() {
   server.on("/api/v1/camera/stop",      HTTP_POST, handleCameraStop);
   server.on("/api/v1/camera/snapshot",  HTTP_GET,  handleCameraSnapshot);
   server.on("/api/v1/camera/stream",    HTTP_GET,  handleCameraStream);
-  server.on("/api/v1/fc/uart",          HTTP_POST, handleFutureUart);
+  server.on("/api/v1/fc/telemetry",     HTTP_GET,  handleFcTelemetry);
+  server.on("/api/v1/fc/rc",            HTTP_POST, handleFcRcSet);
+  server.on("/api/v1/fc/rc/stop",       HTTP_POST, handleFcRcStop);
+  server.on("/api/v1/fc/arm",           HTTP_POST, handleFcArm);
+  server.on("/api/v1/fc/motor-test",    HTTP_POST, handleFcMotorTest);
   server.onNotFound(handleNotFound);
   Serial.println("[HTTP] Routes registered");
 }
@@ -293,6 +593,15 @@ void setup() {
   applyColor(0, 0, 0);
 
   connectWifi();
+  fcSerial.begin(115200, SERIAL_8N1, FC_RX_PIN_VALUE, FC_TX_PIN_VALUE);
+  Serial.printf("[FC] UART1 started — TX=GPIO%d RX=GPIO%d @ 115200\n", FC_TX_PIN_VALUE, FC_RX_PIN_VALUE);
+  appendLog("Boot complete, FC UART initialized");
+  // Initialise RC payload: throttle low (ch2=1000), AUX1 disarm (ch4=1000), others center.
+  for (int i = 0; i < 16; i++) {
+    uint16_t v = (i == 2 || i == 4) ? 1000u : 1500u;
+    rcPayload[i * 2]     = v & 0xFF;
+    rcPayload[i * 2 + 1] = (v >> 8) & 0xFF;
+  }
   registerRoutes();
   server.begin();
   Serial.println("[HTTP] Server listening on port 80");
@@ -300,4 +609,67 @@ void setup() {
 
 void loop() {
   server.handleClient();
+
+  unsigned long now = millis();
+
+  // Motor test state machine — advances between RC sends, never blocks.
+  if (motorTestPhase != MotorTestPhase::IDLE) {
+    unsigned long elapsed = now - motorTestStartMs;
+    switch (motorTestPhase) {
+      case MotorTestPhase::ARMING:
+        if (elapsed >= MT_ARM_MS) {
+          setChannel(2, 1300u);
+          motorTestPhase   = MotorTestPhase::RAMPING;
+          motorTestStartMs = now;
+          appendLog("Motor test -> RAMPING thr=1300");
+        }
+        break;
+      case MotorTestPhase::RAMPING:
+        if (elapsed >= MT_RAMP_MS) {
+          setChannel(2, 1000u);
+          motorTestPhase   = MotorTestPhase::REDUCING;
+          motorTestStartMs = now;
+          appendLog("Motor test -> REDUCING thr=1000");
+        }
+        break;
+      case MotorTestPhase::REDUCING:
+        if (elapsed >= MT_REDUCE_MS) {
+          setChannel(4, 1000u); // disarm AUX1
+          motorTestPhase   = MotorTestPhase::DISARMING;
+          motorTestStartMs = now;
+          appendLog("Motor test -> DISARMING aux1=1000");
+        }
+        break;
+      case MotorTestPhase::DISARMING:
+        if (elapsed >= MT_DISARM_MS) {
+          motorTestPhase    = MotorTestPhase::IDLE;
+          motorTestDisarmMs = now;
+          appendLog("Motor test complete");
+        }
+        break;
+      default: break;
+    }
+  }
+
+  // Send RC at RC_SEND_HZ continuously — ESP32 is always the RC source.
+  if (now - rcLastSentMs >= RC_SEND_PERIOD) {
+    mspSend(MSP_SET_RAW_RC, rcPayload, 32);
+    rcLastSentMs = now;
+  }
+
+  // Request telemetry in round-robin every 400ms without blocking.
+  static unsigned long lastRequestMs = 0;
+  static uint8_t requestTick = 0;
+  if (now - lastRequestMs >= 400) {
+    lastRequestMs = now;
+    if (requestTick == 0)      mspSend(MSP_STATUS, nullptr, 0);
+    else if (requestTick == 1) mspSend(MSP_ATTITUDE, nullptr, 0);
+    else if (requestTick == 2) mspSend(MSP_ANALOG, nullptr, 0);
+    requestTick = (requestTick + 1) % 3;
+  }
+
+  // Continuous parsing of incoming FC bytes
+  while (fcSerial.available()) {
+    parseMspByte(fcSerial.read());
+  }
 }

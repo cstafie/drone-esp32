@@ -29,6 +29,28 @@ type LightResponse = {
   error?: string;
 };
 
+type FcTelemetryResponse = {
+  ok: boolean;
+  armed: boolean;
+  motorTest?: "idle" | "arming" | "ramping" | "reducing" | "disarming";
+  rcThr?: number;
+  rcAux1?: number;
+  rearmCooldownMs?: number;
+  roll?: number;
+  pitch?: number;
+  yaw?: number;
+  vbatV?: number;
+  ampA?: number;
+  fcError?: string;
+};
+
+type LogsResponse = {
+  reachable: boolean;
+  checkedAt: string;
+  logs: string[];
+  error?: string;
+};
+
 function rgbToHex(r: number, g: number, b: number) {
   return "#" + [r, g, b].map((v) => v.toString(16).padStart(2, "0")).join("");
 }
@@ -42,19 +64,32 @@ export default function Home() {
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [light, setLight] = useState<LightResponse | null>(null);
   const [cameraRunning, setCameraRunning] = useState(false);
+  const [fcTelemetry, setFcTelemetry] = useState<FcTelemetryResponse | null>(
+    null,
+  );
   const [pickerColor, setPickerColor] = useState("#ff0000");
   const [pending, setPending] = useState(false);
   const [cameraPending, setCameraPending] = useState(false);
+  const [armTestState, setArmTestState] = useState<
+    "idle" | "confirming" | "running" | "done" | "error"
+  >("idle");
+  const [armTestStatus, setArmTestStatus] = useState("");
+  const [motorTestActive, setMotorTestActive] = useState(false);
+  const [deviceLogs, setDeviceLogs] = useState<string[]>([]);
+  const [logsError, setLogsError] = useState<string | null>(null);
+  const [logsCopied, setLogsCopied] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const pendingRef = useRef(false);
 
   const refresh = useCallback(async () => {
     if (pendingRef.current) return;
     try {
-      const [healthRes, lightRes, camRes] = await Promise.all([
+      const [healthRes, lightRes, camRes, fcRes, logsRes] = await Promise.all([
         fetch("/api/device/health", { cache: "no-store" }),
         fetch("/api/device/light", { cache: "no-store" }),
         fetch("/api/device/camera", { cache: "no-store" }),
+        fetch("/api/device/fc", { cache: "no-store" }),
+        fetch("/api/device/logs", { cache: "no-store" }),
       ]);
 
       const healthJson = (await healthRes.json()) as HealthResponse;
@@ -63,11 +98,35 @@ export default function Home() {
         reachable: boolean;
         camera?: { running: boolean };
       };
+      const fcJson = (await fcRes.json()) as {
+        reachable: boolean;
+        fc?: FcTelemetryResponse;
+      };
+      const logsJson = (await logsRes.json()) as LogsResponse;
 
       setHealth(healthJson);
       if (lightJson.ok) setLight(lightJson);
       if (camJson.reachable && camJson.camera)
         setCameraRunning(camJson.camera.running);
+      if (fcJson.reachable && fcJson.fc) {
+        setFcTelemetry(fcJson.fc);
+        // Detect motor test completion via functional update (no stale closure)
+        if (fcJson.fc.motorTest === "idle") {
+          setMotorTestActive((prev) => {
+            if (prev) {
+              setArmTestState("done");
+              setArmTestStatus("Done ✓");
+            }
+            return false;
+          });
+        }
+      }
+      if (logsJson.reachable) {
+        setDeviceLogs(logsJson.logs ?? []);
+        setLogsError(null);
+      } else {
+        setLogsError(logsJson.error ?? "Failed to fetch logs");
+      }
       setError(
         healthJson.reachable ? null : (healthJson.error ?? "ESP32 unreachable"),
       );
@@ -152,6 +211,50 @@ export default function Home() {
       setCameraPending(false);
     }
   }, [cameraRunning]);
+
+  const motorTestPhaseLabel = useMemo(() => {
+    const phase = fcTelemetry?.motorTest;
+    if (!phase || phase === "idle") return null;
+    const labels: Record<string, string> = {
+      arming: "Arming…",
+      ramping: "Motors at 1300 µs…",
+      reducing: "Reducing throttle…",
+      disarming: "Disarming…",
+    };
+    return labels[phase] ?? phase;
+  }, [fcTelemetry?.motorTest]);
+
+  const runMotorTest = async () => {
+    setArmTestState("running");
+    setArmTestStatus("Starting…");
+    setError(null);
+    try {
+      const res = await fetch("/api/device/fc", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ type: "motor-test" }),
+      });
+      const result = (await res.json()) as { ok: boolean; error?: string };
+      if (!res.ok || !result.ok)
+        throw new Error(result.error ?? "Failed to start motor test");
+      setMotorTestActive(true);
+      setArmTestStatus("Arming…");
+    } catch (err) {
+      setArmTestState("error");
+      setArmTestStatus(err instanceof Error ? err.message : "Start failed");
+    }
+  };
+
+  const copyLogs = async () => {
+    try {
+      await navigator.clipboard.writeText(deviceLogs.join("\n"));
+      setLogsCopied(true);
+      setTimeout(() => setLogsCopied(false), 1200);
+    } catch {
+      setLogsCopied(false);
+      setLogsError("Clipboard copy failed");
+    }
+  };
 
   const statusClass = useMemo(
     () =>
@@ -304,6 +407,145 @@ export default function Home() {
           )}
         </section>
 
+        {/* Flight Controller */}
+        <section className="mt-6 rounded-2xl bg-(--surface) p-5">
+          <div className="flex items-center justify-between gap-4">
+            <p className="text-xs uppercase tracking-[0.16em] text-(--muted)">
+              Flight Controller
+            </p>
+            <span
+              className={
+                fcTelemetry?.armed
+                  ? "status-pill connected"
+                  : "status-pill disconnected"
+              }
+            >
+              {fcTelemetry === null
+                ? "--"
+                : fcTelemetry.armed
+                  ? "ARMED"
+                  : "DISARMED"}
+            </span>
+          </div>
+
+          {fcTelemetry?.fcError ? (
+            <p className="mono mt-3 text-xs text-[#922f17]">
+              {fcTelemetry.fcError}
+            </p>
+          ) : (
+            <div className="mt-3 grid gap-x-6 gap-y-2 md:grid-cols-5">
+              {(
+                [
+                  ["Roll", fcTelemetry?.roll, "°"],
+                  ["Pitch", fcTelemetry?.pitch, "°"],
+                  ["Yaw", fcTelemetry?.yaw, "°"],
+                  ["VBat", fcTelemetry?.vbatV, "V"],
+                  ["Amps", fcTelemetry?.ampA, "A"],
+                ] as [string, number | undefined, string][]
+              ).map(([label, val, unit]) => (
+                <div key={label}>
+                  <p className="text-xs text-(--muted)">{label}</p>
+                  <p className="mono font-medium">
+                    {val !== undefined ? val.toFixed(1) + unit : "--"}
+                  </p>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div className="mt-5 border-t border-black/5 pt-4">
+            <p className="text-xs font-medium">Arm &amp; Motor Test</p>
+            <p className="mt-1 text-xs text-(--muted)">
+              Arms the FC (AUX1 → 1500), spins motors to 1300 µs for 3 s, then
+              disarms. Requires{" "}
+              <span className="mono">set msp_override_channels = 31</span> in
+              Betaflight CLI.
+            </p>
+
+            {armTestState === "confirming" && (
+              <div className="mt-3 rounded-xl border border-[#922f17]/40 bg-[#922f17]/10 p-4">
+                <p className="text-sm font-semibold text-[#922f17]">
+                  ⚠ Confirm Arm &amp; Motor Test
+                </p>
+                <p className="mt-1 text-xs text-(--muted)">
+                  Propellers will spin. Secure the drone and clear the area.
+                </p>
+                <div className="mt-3 flex gap-3">
+                  <button
+                    type="button"
+                    className="btn btn-primary"
+                    style={{ background: "#922f17", borderColor: "#922f17" }}
+                    onClick={() => void runMotorTest()}
+                  >
+                    Confirm — Run Test
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-secondary"
+                    onClick={() => setArmTestState("idle")}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {armTestState === "running" && (
+              <div className="mt-3 rounded-xl bg-(--surface) p-3">
+                <p className="mono text-xs text-(--muted)">
+                  {motorTestPhaseLabel ?? armTestStatus}
+                </p>
+              </div>
+            )}
+
+            {(armTestState === "done" || armTestState === "error") && (
+              <div className="mt-3 rounded-xl bg-(--surface) p-3">
+                <p
+                  className={
+                    armTestState === "error"
+                      ? "mono text-xs text-[#922f17]"
+                      : "mono text-xs text-(--muted)"
+                  }
+                >
+                  {armTestStatus}
+                </p>
+                <button
+                  type="button"
+                  className="btn btn-secondary mt-3"
+                  onClick={() => {
+                    setArmTestState("idle");
+                    setArmTestStatus("");
+                  }}
+                >
+                  Reset
+                </button>
+              </div>
+            )}
+
+            {armTestState === "idle" && (
+              <div className="mt-3 flex flex-wrap items-center gap-3">
+                <button
+                  type="button"
+                  className="btn btn-primary"
+                  disabled={
+                    !health?.reachable ||
+                    !!fcTelemetry?.armed ||
+                    motorTestActive
+                  }
+                  onClick={() => setArmTestState("confirming")}
+                >
+                  Arm &amp; Motor Test
+                </button>
+                {fcTelemetry?.armed && (
+                  <p className="text-xs text-[#922f17]">
+                    Already armed — disarm first
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
+        </section>
+
         {/* Diagnostics */}
         <section className="mt-4 rounded-2xl bg-(--surface) p-4">
           <p className="text-xs uppercase tracking-[0.16em] text-(--muted)">
@@ -321,9 +563,37 @@ export default function Home() {
               ? `${Math.floor(health.device.uptimeMs / 1000)}s`
               : "--"}
           </p>
+          <p className="mono mt-1 text-sm">
+            RC debug: thr={fcTelemetry?.rcThr ?? "--"} aux1=
+            {fcTelemetry?.rcAux1 ?? "--"}
+          </p>
+          <p className="mono mt-1 text-sm">
+            Motor test: {fcTelemetry?.motorTest ?? "--"} cooldown=
+            {fcTelemetry?.rearmCooldownMs ?? 0}ms
+          </p>
           {error ? (
             <p className="mono mt-2 text-sm text-[#922f17]">Error: {error}</p>
           ) : null}
+          {logsError ? (
+            <p className="mono mt-2 text-sm text-[#922f17]">
+              Logs: {logsError}
+            </p>
+          ) : null}
+          <div className="mt-3 rounded-xl border border-black/10 bg-[#f8f8f8] p-3">
+            <div className="flex items-center justify-between gap-3">
+              <p className="text-xs font-medium">ESP32 Event Logs</p>
+              <button
+                type="button"
+                className="btn btn-secondary"
+                onClick={() => void copyLogs()}
+              >
+                {logsCopied ? "Copied" : "Copy Logs"}
+              </button>
+            </div>
+            <pre className="mono mt-2 max-h-44 overflow-auto whitespace-pre-wrap text-xs">
+              {deviceLogs.length > 0 ? deviceLogs.join("\n") : "No logs yet"}
+            </pre>
+          </div>
         </section>
       </main>
     </div>

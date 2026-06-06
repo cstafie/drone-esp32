@@ -77,3 +77,60 @@ export function startCamera() {
 export function stopCamera() {
   return requestEsp32<CameraStatus>("/api/v1/camera/stop", { method: "POST" });
 }
+
+export interface FcTelemetry {
+  ok: boolean;
+  armed: boolean;
+  motorTest?: "idle" | "arming" | "ramping" | "reducing" | "disarming";
+  rcThr?: number;
+  rcAux1?: number;
+  rearmCooldownMs?: number;
+  roll?: number;
+  pitch?: number;
+  yaw?: number;
+  vbatV?: number;
+  ampA?: number;
+  fcError?: string;
+}
+
+export interface DeviceLogs {
+  ok: boolean;
+  logs: string[];
+}
+
+export function getFcTelemetry() {
+  return requestEsp32<FcTelemetry>("/api/v1/fc/telemetry");
+}
+
+export function setFcRc(channels: number[]) {
+  return requestEsp32<{ ok: boolean }>("/api/v1/fc/rc", {
+    method: "POST",
+    body: JSON.stringify({ channels }),
+  });
+}
+
+export function stopFcRc() {
+  return requestEsp32<{ ok: boolean }>("/api/v1/fc/rc/stop", {
+    method: "POST",
+  });
+}
+
+export function armFc(arm: boolean) {
+  return requestEsp32<{ ok: boolean; ack?: boolean }>("/api/v1/fc/arm", {
+    method: "POST",
+    body: JSON.stringify({ arm }),
+  });
+}
+
+export function startMotorTest() {
+  return requestEsp32<{ ok: boolean; phase?: string }>(
+    "/api/v1/fc/motor-test",
+    {
+      method: "POST",
+    },
+  );
+}
+
+export function getLogs() {
+  return requestEsp32<DeviceLogs>("/api/v1/logs");
+}
